@@ -1,0 +1,312 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import quad
+from scipy.special import j0, j1, ellipk, ellipe
+
+# ==============================================================================
+# SEÇÃO 1: VALORES DAS VARIÁVEIS E PARÂMETROS DO MODELO
+# ==============================================================================
+# Parâmetros geométricos (Tabela de parâmetros base)
+a = 500.0        # Raio da pluma de CO2 [m]
+t = 50.0         # Espessura da pluma [m]
+h = 50.0         # Espessura da caprock [m]
+l = 250.0        # Distância vertical da pluma à base da caprock [m]
+
+# Propriedades elásticas e poroelásticas das camadas
+vc = 0.25        # Coeficiente de Poisson da caprock [-]
+vs = 0.25        # Coeficiente de Poisson da storage formation [-]
+vo = 0.25        # Coeficiente de Poisson do overburden [-]
+
+Gc = 67.5e9      # Módulo de cisalhamento elástico da caprock [Pa]
+Go = 2.0e9       # Módulo de cisalhamento elástico do overburden [Pa]
+Gs = 3.0e9       # Módulo de cisalhamento elástico da storage formation [Pa]
+
+p0 = 5.0e6       # Sobrepressão de injeção na pluma [Pa]
+alpha_s = 0.8    # Coeficiente efetivo de Biot da storage formation [-]
+
+# Propriedades elásticas derivadas da placa e do meio contínuo
+D = Gc * (h**3) / (6.0 * (1.0 - vc))                                                          # Eq. 4.16
+E_eq = (4.0 * Gs * (1.0 - vs)) / (3.0 - 4.0 * vs) + (4.0 * Go * (1.0 - vo)) / (3.0 - 4.0 * vo) # Eq. 5.36
+
+# Parâmetros de controle da malha computacional
+R_max = 20.0 * a  # Raio externo de truncamento do domínio (10.000 m)
+
+# ==============================================================================
+# SEÇÃO 2: DISCRETIZAÇÃO DOS ELEMENTOS (FORMAÇÃO DA MALHA RADIAL)
+# ==============================================================================
+# Malha radial graduada (não uniforme):
+# - Região 1 (0 <= r <= 2.5a): malha fina para capturar altos gradientes sob a pluma
+# - Região 2 (2.5a < r <= R_max): malha progressiva até a fronteira truncada
+r_zona_refinada = np.linspace(0.0, 2.5 * a, 81)          # 80 elementos de ~15,625 m
+r_zona_externa  = np.geomspace(2.5 * a, R_max, 41)[1:]   # 40 elementos progressivos
+r_nos           = np.concatenate([r_zona_refinada, r_zona_externa])
+
+n_nos  = len(r_nos)    # Número total de nós (N + 1 = 121)
+n_elem = n_nos - 1     # Número total de elementos finitos (N = 120)
+n_gdl  = 2 * n_nos     # Número total de graus de liberdade globais: 2(N + 1) = 242
+
+# ==============================================================================
+# SEÇÃO 3: DESENVOLVIMENTO NUMÉRICO (MEF + SEMI-ESPAÇO ELÁSTICO)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 3.1. Montagem de [K_placa] e {F_pluma} via Quadratura de Gauss-Legendre
+# ------------------------------------------------------------------------------
+# Abscissas e pesos da Quadratura de Gauss-Legendre de 3 pontos em xi in [0, 1] (Tabela X)
+xi_gauss = np.array([0.5 - np.sqrt(15.0) / 10.0, 0.5, 0.5 + np.sqrt(15.0) / 10.0])
+w_gauss  = np.array([5.0 / 18.0, 8.0 / 18.0, 5.0 / 18.0])
+
+# Matriz constitutiva de flexão da placa
+Db = D * np.array([[1.0, vc],
+                   [vc, 1.0]])  # Eq. 5.19
+
+def calcular_q_pluma(r):
+    """Calcula a pressão efetiva exercida pela pluma na base da caprock no raio r."""
+    fator_pluma = (p0 * a * t * alpha_s * (1.0 - 2.0 * vs)) / (3.0 - 4.0 * vs)
+    xi_trunc = 40.0 / l  # Truncamento da integral imprópria onde exp(-40) ~ 4.2e-18
+    integral_hankel, _ = quad(
+        lambda xi: xi * np.exp(-xi * l) * j1(xi * a) * j0(xi * r),
+        0.0, xi_trunc, limit=200, epsabs=1e-12, epsrel=1e-10
+    )
+    return fator_pluma * integral_hankel  # Eq. 5.41
+
+K_placa = np.zeros((n_gdl, n_gdl))
+F_pluma = np.zeros(n_gdl)
+
+for e in range(n_elem):
+    r1 = r_nos[e]
+    r2 = r_nos[e + 1]
+    Le = r2 - r1
+
+    k_elem = np.zeros((4, 4))
+    f_elem = np.zeros(4)
+
+    for xi, wg in zip(xi_gauss, w_gauss):
+        r_xi = r1 + xi * Le  # Mapeamento inverso da coordenada local xi -> r (Eq. 5.24)
+
+        # Vetor das funções de forma cúbicas de Hermite N(xi)^T
+        N_T = np.array([
+            1.0 - 3.0 * xi**2 + 2.0 * xi**3,
+            Le * (xi - 2.0 * xi**2 + xi**3),
+            3.0 * xi**2 - 2.0 * xi**3,
+            Le * (-xi**2 + xi**3)
+        ])  # Eq. 5.25 e Eq. 5.63
+
+        # Derivadas primeiras dN/dr (Eq. 5.58)
+        dN1_dr = (-6.0 * xi + 6.0 * xi**2) / Le
+        dN2_dr = 1.0 - 4.0 * xi + 3.0 * xi**2
+        dN3_dr = (6.0 * xi - 6.0 * xi**2) / Le
+        dN4_dr = -2.0 * xi + 3.0 * xi**2
+
+        # Derivadas segundas d²N/dr² (Eq. 5.59)
+        d2N1_dr2 = (-6.0 + 12.0 * xi) / (Le**2)
+        d2N2_dr2 = (-4.0 + 6.0 * xi) / Le
+        d2N3_dr2 = (6.0 - 12.0 * xi) / (Le**2)
+        d2N4_dr2 = (-2.0 + 6.0 * xi) / Le
+
+        # Matriz deformação-deslocamento B(xi)
+        B = np.array([
+            [d2N1_dr2, d2N2_dr2, d2N3_dr2, d2N4_dr2],
+            [dN1_dr / r_xi, dN2_dr / r_xi, dN3_dr / r_xi, dN4_dr / r_xi]
+        ])  # Eq. 5.60
+
+        # Integração numérica da matriz de rigidez elementar da placa
+        k_elem += wg * (B.T @ Db @ B) * r_xi * Le  # Eq. 5.61
+
+        # Integração numérica do vetor de forças elementares da pluma
+        q_val = calcular_q_pluma(r_xi)  # Eq. 5.41
+        f_elem += wg * N_T * q_val * r_xi * Le  # Eq. 5.64
+
+    # Montagem (Assembly) nas matrizes e vetores globais
+    gdls_elem = [2 * e, 2 * e + 1, 2 * e + 2, 2 * e + 3]
+    K_placa[np.ix_(gdls_elem, gdls_elem)] += k_elem
+    F_pluma[gdls_elem] += f_elem
+
+# ------------------------------------------------------------------------------
+# 3.2. Montagem de [K_rochas] via Solução Analítica de Boussinesq
+# ------------------------------------------------------------------------------
+def C_disco(r, R):
+    """Deslocamento vertical em r devido a pressão unitária em um disco de raio R."""
+    if R <= 0.0:
+        return 0.0  # Eq. 5.66 (ramo 1)
+    if r <= R:
+        m = (r / R) ** 2
+        return (2.0 * R / (np.pi * E_eq)) * ellipe(m)  # Eq. 5.66 (ramo 2)
+    else:
+        m = (R / r) ** 2
+        return (2.0 * r / (np.pi * E_eq)) * (ellipe(m) - (1.0 - m) * ellipk(m))  # Eq. 5.66 (ramo 3)
+
+# Definição dos raios internos e externos dos anéis tributários de cada nó
+rho_int = np.zeros(n_nos)
+rho_ext = np.zeros(n_nos)
+
+rho_int[0] = 0.0
+rho_ext[0] = 0.5 * (r_nos[0] + r_nos[1])
+
+for j in range(1, n_nos - 1):
+    rho_int[j] = 0.5 * (r_nos[j - 1] + r_nos[j])
+    rho_ext[j] = 0.5 * (r_nos[j] + r_nos[j + 1])
+
+rho_int[-1] = 0.5 * (r_nos[-2] + r_nos[-1])
+rho_ext[-1] = R_max
+
+# Preenchimento da matriz de flexibilidade [C] ((N+1) x (N+1))
+C = np.zeros((n_nos, n_nos))
+for i in range(n_nos):
+    for j in range(n_nos):
+        C[i, j] = C_disco(r_nos[i], rho_ext[j]) - C_disco(r_nos[i], rho_int[j])  # Eq. 5.51 e Eq. 5.66
+
+# Matriz diagonal [A] das áreas anulares reduzidas
+A = np.diag(0.5 * (rho_ext**2 - rho_int**2))  # Eq. 5.53
+
+# Matriz reduzida de rigidez das rochas encaixantes
+K_tilde_rochas = A @ np.linalg.inv(C)  # Eq. 5.54
+
+# Expansão para a matriz global [K_rochas] (2(N+1) x 2(N+1)) nos GDLs de translação
+K_rochas = np.zeros((n_gdl, n_gdl))
+K_rochas[0::2, 0::2] = K_tilde_rochas  # Eq. 5.55
+
+# ------------------------------------------------------------------------------
+# 3.3. Imposição das Condições de Contorno e Resolução do Sistema Global
+# ------------------------------------------------------------------------------
+K_total = K_placa + K_rochas  # Eq. 5.56
+F_mod   = F_pluma.copy()
+
+# Graus de liberdade restritos (indexação base-0 do Python):
+# k = 1         -> theta_1 = 0     (Eq. 5.67)
+# k = n_gdl - 2 -> w_{N+1} = 0     (Eq. 5.68)
+# k = n_gdl - 1 -> theta_{N+1} = 0 (Eq. 5.69)
+gdls_restritos = [1, n_gdl - 2, n_gdl - 1]
+
+for k in gdls_restritos:
+    K_total[k, :] = 0.0
+    K_total[:, k] = 0.0
+    K_total[k, k] = 1.0
+    F_mod[k] = 0.0
+
+# Resolução do sistema algébrico linear global para obtenção de {U}
+U = np.linalg.solve(K_total, F_mod)  # Eq. 5.56 e Eq. 5.57
+
+# Extração dos deslocamentos verticais nodais w_i e rotações nodais theta_i
+w_nodal     = U[0::2]
+theta_nodal = U[1::2]
+
+# ------------------------------------------------------------------------------
+# 3.4. Pós-processamento: Momentos Fletores (M_rr, M_tt) e Tensões (sigma_rr, sigma_tt)
+# ------------------------------------------------------------------------------
+r_eval = []
+M_rr   = []
+M_tt   = []
+
+# Cálculo exato no centro da pluma (r = 0) via regra de L'Hôpital
+Le0 = r_nos[1] - r_nos[0]
+d_elem0 = U[0:4]
+B_linha1_zero = np.array([-6.0 / (Le0**2), -4.0 / Le0, 6.0 / (Le0**2), -2.0 / Le0])
+d2w_dr2_zero = B_linha1_zero @ d_elem0
+M_centro = -D * (1.0 + vc) * d2w_dr2_zero  # Eq. 5.71
+
+r_eval.append(0.0)
+M_rr.append(M_centro)
+M_tt.append(M_centro)
+
+# Cálculo dos momentos nos pontos de Gauss interiores de cada elemento
+for e in range(n_elem):
+    r1 = r_nos[e]
+    r2 = r_nos[e + 1]
+    Le = r2 - r1
+    d_elem = U[2 * e : 2 * e + 4]
+
+    for xi in xi_gauss:
+        r_xi = r1 + xi * Le
+
+        dN1_dr = (-6.0 * xi + 6.0 * xi**2) / Le
+        dN2_dr = 1.0 - 4.0 * xi + 3.0 * xi**2
+        dN3_dr = (6.0 * xi - 6.0 * xi**2) / Le
+        dN4_dr = -2.0 * xi + 3.0 * xi**2
+
+        d2N1_dr2 = (-6.0 + 12.0 * xi) / (Le**2)
+        d2N2_dr2 = (-4.0 + 6.0 * xi) / Le
+        d2N3_dr2 = (6.0 - 12.0 * xi) / (Le**2)
+        d2N4_dr2 = (-2.0 + 6.0 * xi) / Le
+
+        B = np.array([
+            [d2N1_dr2, d2N2_dr2, d2N3_dr2, d2N4_dr2],
+            [dN1_dr / r_xi, dN2_dr / r_xi, dN3_dr / r_xi, dN4_dr / r_xi]
+        ])  # Eq. 5.60
+
+        M_vec = -(Db @ B @ d_elem)  # Eq. 5.70
+
+        r_eval.append(r_xi)
+        M_rr.append(M_vec[0])
+        M_tt.append(M_vec[1])
+
+r_eval = np.array(r_eval)
+M_rr   = np.array(M_rr)
+M_tt   = np.array(M_tt)
+
+# Cálculo das tensões normais ao longo da espessura z in [-h/2, +h/2]
+cotas_z = {
+    "+h/2 (topo)":  +h / 2.0,
+    "+h/4":         +h / 4.0,
+    "0 (neutra)":    0.0,
+    "-h/4":         -h / 4.0,
+    "-h/2 (base)":  -h / 2.0,
+}
+
+tensoes_rr = {}
+tensoes_tt = {}
+
+for nome_plano, z in cotas_z.items():
+    tensoes_rr[nome_plano] = (12.0 * z / (h**3)) * M_rr  # Eq. 4.60
+    tensoes_tt[nome_plano] = (12.0 * z / (h**3)) * M_tt  # Eq. 4.65
+
+# ==============================================================================
+# SEÇÃO 4: VISUALIZAÇÃO DOS RESULTADOS NUMÉRICOS (ESPELHADOS COM AS FIGURAS 16-19)
+# ==============================================================================
+print(f"Soerguimento máximo no centro w(0) = {w_nodal[0]*1000:.4f} mm")
+print(f"Momento fletor no centro M_rr(0)   = {M_rr[0]/1e3:.4f} kN.m/m")
+print(f"Tensão radial topo sigma_rr(0,+h/2)= {tensoes_rr['+h/2 (topo)'][0]/1e6:.4f} MPa")
+
+fig, axs = plt.subplots(2, 2, figsize=(13, 9))
+
+# Gráfico 1: Deslocamento Vertical w(r) (Comparável à Fig. 16)
+axs[0, 0].plot(r_nos, w_nodal * 1000.0, 'b-', linewidth=1.8)
+axs[0, 0].set_title("Deslocamento Vertical da Caprock w(r)")
+axs[0, 0].set_xlabel("Raio r (m)")
+axs[0, 0].set_ylabel("Deslocamento vertical w (mm)")
+axs[0, 0].set_xlim(0, 1000)
+axs[0, 0].grid(True, alpha=0.4)
+
+# Gráfico 2: Momentos Fletores M_rr e M_tt (Comparável à Fig. 17)
+axs[0, 1].plot(r_eval, M_rr / 1e3, 'r-', linewidth=1.8, label=r"$M_{rr}$ (Radial)")
+axs[0, 1].plot(r_eval, M_tt / 1e3, 'b--', linewidth=1.8, label=r"$M_{\theta\theta}$ (Tangencial)")
+axs[0, 1].set_title("Momentos Fletores na Caprock")
+axs[0, 1].set_xlabel("Raio r (m)")
+axs[0, 1].set_ylabel("Momento Fletor (kN·m/m)")
+axs[0, 1].set_xlim(0, 1000)
+axs[0, 1].legend()
+axs[0, 1].grid(True, alpha=0.4)
+
+# Gráfico 3: Distribuição da Tensão Radial sigma_rr(z, r) (Comparável à Fig. 18)
+estilos = ['-', '--', ':', '--', '-']
+for (nome_plano, sigma_vals), ls in zip(tensoes_rr.items(), estilos):
+    axs[1, 0].plot(r_eval, sigma_vals / 1e6, linestyle=ls, linewidth=1.6, label=f"z = {nome_plano}")
+axs[1, 0].set_title(r"Distribuição da Tensão Radial $\sigma_{rr}(z, r)$")
+axs[1, 0].set_xlabel("Raio r (m)")
+axs[1, 0].set_ylabel(r"$\sigma_{rr}$ (MPa)")
+axs[1, 0].set_xlim(0, 1000)
+axs[1, 0].legend(fontsize=8)
+axs[1, 0].grid(True, alpha=0.4)
+
+# Gráfico 4: Distribuição da Tensão Tangencial sigma_tt(z, r) (Comparável à Fig. 19)
+for (nome_plano, sigma_vals), ls in zip(tensoes_tt.items(), estilos):
+    axs[1, 1].plot(r_eval, sigma_vals / 1e6, linestyle=ls, linewidth=1.6, label=f"z = {nome_plano}")
+axs[1, 1].set_title(r"Distribuição da Tensão Tangencial $\sigma_{\theta\theta}(z, r)$")
+axs[1, 1].set_xlabel("Raio r (m)")
+axs[1, 1].set_ylabel(r"$\sigma_{\theta\theta}$ (MPa)")
+axs[1, 1].set_xlim(0, 1000)
+axs[1, 1].legend(fontsize=8)
+axs[1, 1].grid(True, alpha=0.4)
+
+plt.tight_layout()
+plt.savefig("resultados_mef_caprock.png", dpi=300, bbox_inches="tight")
